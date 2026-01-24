@@ -1,83 +1,112 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DBAR Survey — Survey</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body class="survey">
-  <header class="site-header">
-    <div class="container header-inner">
-      <a class="brand" href="index.html">DBAR Survey</a>
-      <nav>
-        <a class="btn btn-outline" href="index.html">Home</a>
-      </nav>
-    </div>
-  </header>
+// Simple chat server using Express + Socket.io
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
 
-  <main class="container survey-main" role="main">
-    <section class="survey-card" aria-labelledby="survey-heading">
-      <h2 id="survey-heading">DBAR Quick Survey</h2>
-      <p class="muted">We appreciate your time — this should take less than 2 minutes.</p>
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
 
-      <form id="surveyForm" action="#" method="POST" onsubmit="handleSubmit(event)">
-        <label for="name">Full name</label>
-        <input id="name" name="name" type="text" required placeholder="Your name" />
+// In-memory room store: { roomName: { users: Map(socketId -> username), history: Array<message> } }
+const rooms = new Map();
 
-        <label for="email">Email (optional)</label>
-        <input id="email" name="email" type="email" placeholder="you@example.com" />
+const PORT = process.env.PORT || 3000;
 
-        <label for="experience">How satisfied are you with DBAR?</label>
-        <select id="experience" name="experience" required>
-          <option value="">Choose...</option>
-          <option value="5">Very satisfied</option>
-          <option value="4">Satisfied</option>
-          <option value="3">Neutral</option>
-          <option value="2">Dissatisfied</option>
-          <option value="1">Very dissatisfied</option>
-        </select>
+app.use(express.static(path.join(__dirname, 'public')));
 
-        <fieldset>
-          <legend>Which features matter most to you? (select all that apply)</legend>
-          <label><input type="checkbox" name="features" value="reports" /> Reports</label>
-          <label><input type="checkbox" name="features" value="dashboards" /> Dashboards</label>
-          <label><input type="checkbox" name="features" value="export" /> Exporting data</label>
-        </fieldset>
+io.on('connection', (socket) => {
+  console.log('socket connected:', socket.id);
 
-        <label for="comments">Comments (optional)</label>
-        <textarea id="comments" name="comments" rows="4" placeholder="Anything else to share?"></textarea>
+  socket.on('join', ({ username, room }) => {
+    if (!username || !room) return;
+    username = String(username).trim().slice(0, 32);
+    room = String(room).trim().toLowerCase().slice(0, 64);
 
-        <div class="form-actions">
-          <button type="submit" class="btn btn-primary">Submit Survey</button>
-          <button type="reset" class="btn btn-outline">Reset</button>
-        </div>
+    socket.data.username = username;
+    socket.data.room = room;
 
-        <p id="status" class="muted" aria-live="polite" style="margin-top:0.5rem"></p>
-      </form>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <div class="container">
-      <small>&copy; <span id="year2"></span> DBAR Survey</small>
-    </div>
-  </footer>
-
-  <script>
-    document.getElementById('year2').textContent = new Date().getFullYear();
-
-    function handleSubmit(e) {
-      e.preventDefault();
-      const status = document.getElementById('status');
-      status.textContent = 'Submitting...';
-
-      // This is a placeholder. Replace with real POST to your server.
-      setTimeout(() => {
-        status.textContent = 'Thanks — your responses have been recorded.';
-        e.target.reset();
-      }, 800);
+    if (!rooms.has(room)) {
+      rooms.set(room, { users: new Map(), history: [] });
     }
-  </script>
-</body>
-</html>
+    const roomData = rooms.get(room);
+    roomData.users.set(socket.id, username);
+    socket.join(room);
+
+    // Send existing history (last 200 messages)
+    socket.emit('history', roomData.history);
+
+    // Notify room of new user list and system message
+    io.to(room).emit('users', Array.from(roomData.users.values()));
+    const joinMsg = {
+      id: generateId(),
+      username: 'System',
+      text: `${username} joined the room.`,
+      ts: Date.now(),
+      system: true
+    };
+    pushHistory(roomData, joinMsg);
+    io.to(room).emit('message', joinMsg);
+
+    console.log(`${username} joined room ${room}`);
+  });
+
+  socket.on('message', (text) => {
+    const username = socket.data.username;
+    const room = socket.data.room;
+    if (!username || !room) return;
+    const cleanText = String(text).slice(0, 2000);
+    const msg = {
+      id: generateId(),
+      username,
+      text: cleanText,
+      ts: Date.now(),
+      system: false
+    };
+    const roomData = rooms.get(room);
+    if (!roomData) return;
+    pushHistory(roomData, msg);
+    io.to(room).emit('message', msg);
+  });
+
+  socket.on('disconnect', () => {
+    const username = socket.data.username;
+    const room = socket.data.room;
+    if (room && rooms.has(room)) {
+      const roomData = rooms.get(room);
+      roomData.users.delete(socket.id);
+      // Emit updated users
+      io.to(room).emit('users', Array.from(roomData.users.values()));
+      const leaveMsg = {
+        id: generateId(),
+        username: 'System',
+        text: `${username || 'A user'} left the room.`,
+        ts: Date.now(),
+        system: true
+      };
+      pushHistory(roomData, leaveMsg);
+      io.to(room).emit('message', leaveMsg);
+
+      // If room is empty, remove it to free memory
+      if (roomData.users.size === 0) {
+        rooms.delete(room);
+      }
+    }
+    console.log('socket disconnected:', socket.id);
+  });
+});
+
+function pushHistory(roomData, msg) {
+  roomData.history.push(msg);
+  if (roomData.history.length > 200) {
+    roomData.history.shift();
+  }
+}
+
+function generateId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+server.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});
